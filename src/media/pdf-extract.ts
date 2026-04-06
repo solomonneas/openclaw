@@ -1,8 +1,35 @@
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+
 type CanvasModule = typeof import("@napi-rs/canvas");
 type PdfJsModule = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
 
 let canvasModulePromise: Promise<CanvasModule> | null = null;
 let pdfJsModulePromise: Promise<PdfJsModule> | null = null;
+let standardFontDataUrlCache: string | null = null;
+
+// pdf.js needs `standardFontDataUrl` to render PDFs that reference the 14
+// standard PDF fonts (Helvetica, Times, Courier, etc.). Without it, every such
+// document throws `UnknownErrorException: Ensure that the standardFontDataUrl
+// API parameter is provided`, which then yields empty/garbled text extraction.
+// The font files ship inside `pdfjs-dist/standard_fonts/`, so we resolve that
+// path through the actual module resolver (works regardless of bundling).
+function getStandardFontDataUrl(): string | undefined {
+  if (standardFontDataUrlCache !== null) {
+    return standardFontDataUrlCache || undefined;
+  }
+  try {
+    const require = createRequire(import.meta.url);
+    const pkgPath = require.resolve("pdfjs-dist/package.json");
+    const fontDir = join(dirname(pkgPath), "standard_fonts/");
+    standardFontDataUrlCache = pathToFileURL(fontDir).href;
+    return standardFontDataUrlCache;
+  } catch {
+    standardFontDataUrlCache = "";
+    return undefined;
+  }
+}
 
 async function loadCanvasModule(): Promise<CanvasModule> {
   if (!canvasModulePromise) {
@@ -49,7 +76,11 @@ export async function extractPdfContent(params: {
 }): Promise<PdfExtractedContent> {
   const { buffer, maxPages, maxPixels, minTextChars, pageNumbers, onImageExtractionError } = params;
   const { getDocument } = await loadPdfJsModule();
-  const pdf = await getDocument({ data: new Uint8Array(buffer), disableWorker: true }).promise;
+  const pdf = await getDocument({
+    data: new Uint8Array(buffer),
+    disableWorker: true,
+    standardFontDataUrl: getStandardFontDataUrl(),
+  }).promise;
 
   const effectivePages: number[] = pageNumbers
     ? pageNumbers.filter((p) => p >= 1 && p <= pdf.numPages).slice(0, maxPages)
