@@ -76,11 +76,20 @@ export async function extractPdfContent(params: {
 }): Promise<PdfExtractedContent> {
   const { buffer, maxPages, maxPixels, minTextChars, pageNumbers, onImageExtractionError } = params;
   const { getDocument } = await loadPdfJsModule();
-  const pdf = await getDocument({
+  // `pdfjs-dist/legacy/build/pdf.mjs` ships narrower `.d.ts` than the runtime
+  // accepts: `DocumentInitParameters` includes `standardFontDataUrl`, but the
+  // legacy build's inline types only declare `{ data, disableWorker }`. Extend
+  // the inferred parameter type structurally so we can pass the
+  // runtime-supported option without an `any` cast.
+  type GetDocumentParams = Parameters<typeof getDocument>[0] & {
+    standardFontDataUrl?: string | URL;
+  };
+  const params: GetDocumentParams = {
     data: new Uint8Array(buffer),
     disableWorker: true,
     standardFontDataUrl: getStandardFontDataUrl(),
-  }).promise;
+  };
+  const pdf = await getDocument(params).promise;
 
   const effectivePages: number[] = pageNumbers
     ? pageNumbers.filter((p) => p >= 1 && p <= pdf.numPages).slice(0, maxPages)
