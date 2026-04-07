@@ -84,12 +84,12 @@ export async function extractPdfContent(params: {
   type GetDocumentParams = Parameters<typeof getDocument>[0] & {
     standardFontDataUrl?: string | URL;
   };
-  const params: GetDocumentParams = {
+  const getDocumentParams: GetDocumentParams = {
     data: new Uint8Array(buffer),
     disableWorker: true,
     standardFontDataUrl: getStandardFontDataUrl(),
   };
-  const pdf = await getDocument(params).promise;
+  const pdf = await getDocument(getDocumentParams).promise;
 
   const effectivePages: number[] = pageNumbers
     ? pageNumbers.filter((p) => p >= 1 && p <= pdf.numPages).slice(0, maxPages)
