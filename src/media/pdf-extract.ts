@@ -19,18 +19,15 @@ let standardFontDataPathCache: string | null = null;
 //
 // Register a handler through OpenClaw's own unhandled-rejection system so the
 // pdfjs worker error is marked as handled before the crash handler sees it.
+//
+// The check is intentionally narrow: we require the stack to contain both the
+// pdf.worker.mjs module path AND the `ModuleJob.run` frame that indicates this
+// is the known top-level worker initialization error, not a runtime failure
+// from an actual pdf.js operation.
 registerUnhandledRejectionHandler((reason: unknown): boolean => {
   const err = reason as { message?: string; stack?: string } | undefined;
-  const text =
-    String(err?.message ?? "") + " " + String(err?.stack ?? "");
-  if (
-    text.includes("BaseException") ||
-    text.includes("pdf.worker") ||
-    text.includes("pdfjs-dist")
-  ) {
-    return true;
-  }
-  return false;
+  const stack = String(err?.stack ?? "");
+  return stack.includes("pdf.worker") && stack.includes("ModuleJob.run");
 });
 
 // pdf.js needs `standardFontDataUrl` to render PDFs that reference the 14

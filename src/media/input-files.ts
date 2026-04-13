@@ -391,7 +391,7 @@ export async function extractFileContentFromSource(params: {
       };
     } catch (pdfErr) {
       logWarn(`media: PDF extraction failed for ${filename}: ${String(pdfErr)}`);
-      return { filename, text: "" };
+      return { filename, text: `[PDF: ${filename} — text extraction failed]` };
     }
   }
 
