@@ -1,12 +1,37 @@
 import { createRequire } from "node:module";
 import { dirname, join, sep } from "node:path";
 
+import { registerUnhandledRejectionHandler } from "../infra/unhandled-rejections.js";
+
 type CanvasModule = typeof import("@napi-rs/canvas");
 type PdfJsModule = typeof import("pdfjs-dist/legacy/build/pdf.mjs");
 
 let canvasModulePromise: Promise<CanvasModule> | null = null;
 let pdfJsModulePromise: Promise<PdfJsModule> | null = null;
 let standardFontDataPathCache: string | null = null;
+
+// pdf.js dynamically imports pdf.worker.mjs during `getDocument()`. Even with
+// `disableWorker: true`, the worker module initialization can throw an
+// unhandled rejection (`BaseExceptionClosure` at module top-level). This
+// rejection is asynchronous and escapes all try-catch boundaries at the call
+// site. Without suppression, it reaches the gateway's unhandled-rejection
+// handler, which calls `process.exit(1)` and crashes the entire gateway.
+//
+// Register a handler through OpenClaw's own unhandled-rejection system so the
+// pdfjs worker error is marked as handled before the crash handler sees it.
+registerUnhandledRejectionHandler((reason: unknown): boolean => {
+  const err = reason as { message?: string; stack?: string } | undefined;
+  const text =
+    String(err?.message ?? "") + " " + String(err?.stack ?? "");
+  if (
+    text.includes("BaseException") ||
+    text.includes("pdf.worker") ||
+    text.includes("pdfjs-dist")
+  ) {
+    return true;
+  }
+  return false;
+});
 
 // pdf.js needs `standardFontDataUrl` to render PDFs that reference the 14
 // standard PDF fonts (Helvetica, Times, Courier, etc.). Without it, every such
