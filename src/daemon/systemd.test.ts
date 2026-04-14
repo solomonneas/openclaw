@@ -793,6 +793,10 @@ describe("systemd service control", () => {
 
 describe("stageSystemdService drop-in migration", () => {
   beforeEach(() => {
+    // Clear fs.readFile spies from earlier describe blocks so this one runs
+    // against real fs. We want real file-write behavior here — only the
+    // systemctl probe should be mocked.
+    vi.restoreAllMocks();
     execFileMock.mockReset();
     // Every writeSystemdUnit path asserts systemd is available before touching
     // disk. Return success for any systemctl call so the integration can focus
