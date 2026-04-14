@@ -35,9 +35,14 @@ import {
   isSystemdUserBusUnavailableDetail,
 } from "./systemd-unavailable.js";
 import {
+  buildSystemdManagedDropIn,
   buildSystemdUnit,
+  OPENCLAW_MANAGED_DROPIN_FILENAME,
   parseSystemdEnvAssignment,
   parseSystemdExecStart,
+  splitSystemdManagedEnvironment,
+  stripManagedEnvFromSystemdUnit,
+  updateExecStartInSystemdUnit,
 } from "./systemd-unit.js";
 
 function resolveSystemdUnitPathForName(env: GatewayServiceEnv, name: string): string {
@@ -57,8 +62,19 @@ function resolveSystemdUnitPath(env: GatewayServiceEnv): string {
   return resolveSystemdUnitPathForName(env, resolveSystemdServiceName(env));
 }
 
+function resolveSystemdManagedDropInPath(env: GatewayServiceEnv): string {
+  const unitPath = resolveSystemdUnitPath(env);
+  const unitDir = path.posix.dirname(unitPath);
+  const unitFile = path.posix.basename(unitPath);
+  return path.posix.join(unitDir, `${unitFile}.d`, OPENCLAW_MANAGED_DROPIN_FILENAME);
+}
+
 export function resolveSystemdUserUnitPath(env: GatewayServiceEnv): string {
   return resolveSystemdUnitPath(env);
+}
+
+export function resolveSystemdUserManagedDropInPath(env: GatewayServiceEnv): string {
+  return resolveSystemdManagedDropInPath(env);
 }
 
 export { enableSystemdUserLinger, readSystemdUserLingerStatus };
@@ -66,58 +82,87 @@ export type { SystemdUserLingerStatus };
 
 // Unit file parsing/rendering: see systemd-unit.ts
 
+function parseSystemdUnitText(text: string): {
+  execStart: string;
+  workingDirectory: string;
+  inlineEnvironment: Record<string, string>;
+  environmentFileSpecs: string[];
+} {
+  let execStart = "";
+  let workingDirectory = "";
+  const inlineEnvironment: Record<string, string> = {};
+  const environmentFileSpecs: string[] = [];
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    if (line.startsWith("ExecStart=")) {
+      execStart = line.slice("ExecStart=".length).trim();
+    } else if (line.startsWith("WorkingDirectory=")) {
+      workingDirectory = line.slice("WorkingDirectory=".length).trim();
+    } else if (line.startsWith("Environment=")) {
+      const raw = line.slice("Environment=".length).trim();
+      const parsed = parseSystemdEnvAssignment(raw);
+      if (parsed) {
+        inlineEnvironment[parsed.key] = parsed.value;
+      }
+    } else if (line.startsWith("EnvironmentFile=")) {
+      const raw = line.slice("EnvironmentFile=".length).trim();
+      if (raw) {
+        environmentFileSpecs.push(raw);
+      }
+    }
+  }
+  return { execStart, workingDirectory, inlineEnvironment, environmentFileSpecs };
+}
+
 export async function readSystemdServiceExecStart(
   env: GatewayServiceEnv,
 ): Promise<GatewayServiceCommandConfig | null> {
   const unitPath = resolveSystemdUnitPath(env);
+  const dropInPath = resolveSystemdManagedDropInPath(env);
   try {
-    const content = await fs.readFile(unitPath, "utf8");
-    let execStart = "";
-    let workingDirectory = "";
-    const inlineEnvironment: Record<string, string> = {};
-    const environmentFileSpecs: string[] = [];
-    for (const rawLine of content.split("\n")) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith("#")) {
-        continue;
-      }
-      if (line.startsWith("ExecStart=")) {
-        execStart = line.slice("ExecStart=".length).trim();
-      } else if (line.startsWith("WorkingDirectory=")) {
-        workingDirectory = line.slice("WorkingDirectory=".length).trim();
-      } else if (line.startsWith("Environment=")) {
-        const raw = line.slice("Environment=".length).trim();
-        const parsed = parseSystemdEnvAssignment(raw);
-        if (parsed) {
-          inlineEnvironment[parsed.key] = parsed.value;
-        }
-      } else if (line.startsWith("EnvironmentFile=")) {
-        const raw = line.slice("EnvironmentFile=".length).trim();
-        if (raw) {
-          environmentFileSpecs.push(raw);
-        }
-      }
-    }
-    if (!execStart) {
+    const mainContent = await fs.readFile(unitPath, "utf8");
+    const main = parseSystemdUnitText(mainContent);
+    if (!main.execStart) {
       return null;
     }
+
+    // Merge drop-in env as a separate inline source so the install-time
+    // preservation pipeline sees every key the running service actually has.
+    // Drop-in values override main-unit inline values by design: operators
+    // depend on the managed drop-in to carry the canonical token/version
+    // state across upgrades.
+    const dropInContent = await readOptionalFile(dropInPath);
+    const dropInParsed = dropInContent ? parseSystemdUnitText(dropInContent) : null;
+
+    const combinedInlineEnvironment: Record<string, string> = {
+      ...main.inlineEnvironment,
+      ...(dropInParsed?.inlineEnvironment ?? {}),
+    };
+    const combinedEnvironmentFileSpecs: string[] = [
+      ...main.environmentFileSpecs,
+      ...(dropInParsed?.environmentFileSpecs ?? []),
+    ];
+
     const environmentFromFiles = await resolveSystemdEnvironmentFiles({
-      environmentFileSpecs,
+      environmentFileSpecs: combinedEnvironmentFileSpecs,
       env,
       unitPath,
     });
     const mergedEnvironment = {
-      ...inlineEnvironment,
+      ...combinedInlineEnvironment,
       ...environmentFromFiles.environment,
     };
     const mergedEnvironmentSources = {
-      ...buildEnvironmentValueSources(inlineEnvironment, "inline"),
+      ...buildEnvironmentValueSources(combinedInlineEnvironment, "inline"),
       ...buildEnvironmentValueSources(environmentFromFiles.environment, "file"),
     };
-    const programArguments = parseSystemdExecStart(execStart);
+    const programArguments = parseSystemdExecStart(main.execStart);
     return {
       programArguments,
-      ...(workingDirectory ? { workingDirectory } : {}),
+      ...(main.workingDirectory ? { workingDirectory: main.workingDirectory } : {}),
       ...(Object.keys(mergedEnvironment).length > 0 ? { environment: mergedEnvironment } : {}),
       ...(Object.keys(mergedEnvironmentSources).length > 0
         ? { environmentValueSources: mergedEnvironmentSources }
@@ -425,45 +470,126 @@ async function assertSystemdAvailable(env: GatewayServiceEnv = process.env as Ga
   throw new Error(`systemctl --user unavailable: ${detail || "unknown error"}`.trim());
 }
 
+async function readOptionalFile(pathname: string): Promise<string | null> {
+  try {
+    return await fs.readFile(pathname, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
 async function writeSystemdUnit({
   env,
   programArguments,
   workingDirectory,
   environment,
   description,
-}: Omit<GatewayServiceInstallArgs, "stdout">): Promise<{ unitPath: string; backedUp: boolean }> {
+}: Omit<GatewayServiceInstallArgs, "stdout">): Promise<{
+  unitPath: string;
+  dropInPath: string;
+  backedUp: boolean;
+  mainUnitWritten: boolean;
+  dropInWritten: boolean;
+  migratedInlineManagedEnv: boolean;
+}> {
   await assertSystemdAvailable(env);
 
   const unitPath = resolveSystemdUnitPath(env);
+  const dropInPath = resolveSystemdManagedDropInPath(env);
   await fs.mkdir(path.dirname(unitPath), { recursive: true });
-
-  // Preserve user customizations: back up existing unit file before overwriting.
-  let backedUp = false;
-  try {
-    await fs.access(unitPath);
-    const backupPath = `${unitPath}.bak`;
-    await fs.copyFile(unitPath, backupPath);
-    backedUp = true;
-  } catch {
-    // File does not exist yet — nothing to back up.
-  }
+  await fs.mkdir(path.dirname(dropInPath), { recursive: true });
 
   const serviceDescription = resolveGatewayServiceDescription({ env, environment, description });
-  const unit = buildSystemdUnit({
-    description: serviceDescription,
-    programArguments,
-    workingDirectory,
-    environment,
-  });
-  await fs.writeFile(unitPath, unit, "utf8");
-  return { unitPath, backedUp };
+  const { managed } = splitSystemdManagedEnvironment(environment);
+  const dropInText = buildSystemdManagedDropIn(environment);
+
+  const existingUnit = await readOptionalFile(unitPath);
+  let backedUp = false;
+  let mainUnitWritten = false;
+  let migratedInlineManagedEnv = false;
+
+  if (existingUnit === null) {
+    // Fresh install — write a clean main unit with only user-preserved env.
+    // Managed keys go into the drop-in exclusively so future upgrades can
+    // rewrite the drop-in freely without touching the main unit.
+    const freshUnit = buildSystemdUnit({
+      description: serviceDescription,
+      programArguments,
+      workingDirectory,
+      environment,
+    });
+    await fs.writeFile(unitPath, freshUnit, "utf8");
+    mainUnitWritten = true;
+  } else {
+    // Existing unit — migrate inline managed env out if present, update
+    // ExecStart when the entry path has drifted between versions, and keep
+    // everything else (user EnvironmentFile=, user Environment=, comments,
+    // custom [Service] directives) verbatim.
+    const strippedText = stripManagedEnvFromSystemdUnit(existingUnit);
+    migratedInlineManagedEnv = strippedText !== existingUnit;
+    const { text: execStartUpdated, updated: execStartChanged } = updateExecStartInSystemdUnit(
+      strippedText,
+      programArguments,
+    );
+
+    if (execStartUpdated !== existingUnit) {
+      // Back up before rewriting so operators can diff if the migration or
+      // ExecStart update removes something unexpected.
+      const backupPath = `${unitPath}.bak`;
+      await fs.copyFile(unitPath, backupPath);
+      backedUp = true;
+      await fs.writeFile(unitPath, execStartUpdated, "utf8");
+      mainUnitWritten = true;
+    }
+
+    // Touching only the drop-in on pure-env changes keeps the main unit
+    // byte-identical across upgrades when nothing else drifted. execStartChanged
+    // is captured separately so callers/log surfaces can reason about why the
+    // main unit changed when it did.
+    void execStartChanged;
+  }
+
+  let dropInWritten = false;
+  if (dropInText) {
+    await fs.writeFile(dropInPath, dropInText, "utf8");
+    dropInWritten = true;
+  } else {
+    // No managed env this round — remove a stale drop-in so we never leave
+    // orphan managed state on disk after a reconfiguration shrinks the
+    // managed set to zero.
+    try {
+      await fs.unlink(dropInPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+
+  // Silence unused-variable lint when `managed` is empty but we still want the
+  // split result available for future introspection hooks without exporting
+  // another readCommand seam.
+  void managed;
+
+  return {
+    unitPath,
+    dropInPath,
+    backedUp,
+    mainUnitWritten,
+    dropInWritten,
+    migratedInlineManagedEnv,
+  };
 }
 
 export async function stageSystemdService({
   stdout,
   ...args
-}: GatewayServiceInstallArgs): Promise<{ unitPath: string }> {
-  const { unitPath, backedUp } = await writeSystemdUnit(args);
+}: GatewayServiceInstallArgs): Promise<{ unitPath: string; dropInPath: string }> {
+  const { unitPath, dropInPath, backedUp, dropInWritten, migratedInlineManagedEnv } =
+    await writeSystemdUnit(args);
   writeFormattedLines(
     stdout,
     [
@@ -471,6 +597,22 @@ export async function stageSystemdService({
         label: "Staged systemd service",
         value: unitPath,
       },
+      ...(dropInWritten
+        ? [
+            {
+              label: "Managed env drop-in",
+              value: dropInPath,
+            },
+          ]
+        : []),
+      ...(migratedInlineManagedEnv
+        ? [
+            {
+              label: "Migrated inline managed env to drop-in",
+              value: dropInPath,
+            },
+          ]
+        : []),
       ...(backedUp
         ? [
             {
@@ -482,7 +624,7 @@ export async function stageSystemdService({
     ],
     { leadingBlankLine: true },
   );
-  return { unitPath };
+  return { unitPath, dropInPath };
 }
 
 async function activateSystemdService(params: { env: GatewayServiceEnv }) {
@@ -506,8 +648,9 @@ async function activateSystemdService(params: { env: GatewayServiceEnv }) {
 
 export async function installSystemdService(
   args: GatewayServiceInstallArgs,
-): Promise<{ unitPath: string }> {
-  const { unitPath, backedUp } = await writeSystemdUnit(args);
+): Promise<{ unitPath: string; dropInPath: string }> {
+  const { unitPath, dropInPath, backedUp, dropInWritten, migratedInlineManagedEnv } =
+    await writeSystemdUnit(args);
   await activateSystemdService({ env: args.env });
   writeFormattedLines(
     args.stdout,
@@ -516,6 +659,22 @@ export async function installSystemdService(
         label: "Installed systemd service",
         value: unitPath,
       },
+      ...(dropInWritten
+        ? [
+            {
+              label: "Managed env drop-in",
+              value: dropInPath,
+            },
+          ]
+        : []),
+      ...(migratedInlineManagedEnv
+        ? [
+            {
+              label: "Migrated inline managed env to drop-in",
+              value: dropInPath,
+            },
+          ]
+        : []),
       ...(backedUp
         ? [
             {
@@ -527,7 +686,7 @@ export async function installSystemdService(
     ],
     { leadingBlankLine: true },
   );
-  return { unitPath };
+  return { unitPath, dropInPath };
 }
 
 export async function uninstallSystemdService({
@@ -545,6 +704,24 @@ export async function uninstallSystemdService({
     stdout.write(`${formatLine("Removed systemd service", unitPath)}\n`);
   } catch {
     stdout.write(`Systemd service not found at ${unitPath}\n`);
+  }
+
+  // Also remove the managed drop-in (if any) and its parent `.d/` directory
+  // when it becomes empty. Leaves untouched any user drop-ins the operator
+  // added alongside the managed one.
+  const dropInPath = resolveSystemdManagedDropInPath(env);
+  try {
+    await fs.unlink(dropInPath);
+    stdout.write(`${formatLine("Removed managed env drop-in", dropInPath)}\n`);
+  } catch {
+    // Missing drop-in is the common case for pre-drop-in installs or fresh
+    // unit configurations; do not surface that as an error.
+  }
+  try {
+    const dropInDir = path.posix.dirname(dropInPath);
+    await fs.rmdir(dropInDir);
+  } catch {
+    // Directory is either missing or still holds user drop-ins — leave it alone.
   }
 }
 

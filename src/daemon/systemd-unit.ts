@@ -3,6 +3,23 @@ import type { GatewayServiceRenderArgs } from "./service-types.js";
 
 const SYSTEMD_LINE_BREAKS = /[\r\n]/;
 
+/**
+ * Filename for the OpenClaw-owned drop-in that carries managed environment
+ * variables. The drop-in is written into `<unit>.d/` next to the main unit so
+ * systemd composes it automatically at load time. Keeping managed env out of
+ * the main unit lets user-added `EnvironmentFile=`/`Environment=` directives
+ * survive upgrades that regenerate the managed state.
+ */
+export const OPENCLAW_MANAGED_DROPIN_FILENAME = "openclaw-managed.conf";
+
+/**
+ * Env var that tracks which keys in the managed drop-in (or, for legacy units,
+ * inline in the main unit) are OpenClaw-owned. Mirrors the constant in
+ * `src/commands/daemon-install-helpers.ts`; duplicated here to keep
+ * `systemd-unit.ts` free of cross-module imports.
+ */
+export const OPENCLAW_MANAGED_SERVICE_ENV_KEYS_VAR = "OPENCLAW_SERVICE_MANAGED_ENV_KEYS";
+
 function assertNoSystemdLineBreaks(value: string, label: string): void {
   if (SYSTEMD_LINE_BREAKS.test(value)) {
     throw new Error(`${label} cannot contain CR or LF characters.`);
@@ -35,12 +52,65 @@ function renderEnvLines(env: Record<string, string | undefined> | undefined): st
   });
 }
 
+function parseManagedKeyList(raw: string | undefined): Set<string> {
+  if (!raw) {
+    return new Set();
+  }
+  const keys = new Set<string>();
+  for (const entry of raw.split(",")) {
+    const normalized = entry.trim().toUpperCase();
+    if (normalized) {
+      keys.add(normalized);
+    }
+  }
+  return keys;
+}
+
+/**
+ * Split an environment dict into managed and user partitions based on the
+ * `OPENCLAW_SERVICE_MANAGED_ENV_KEYS` sentinel. Managed keys (plus the sentinel
+ * itself) belong in the drop-in; everything else belongs in the main unit so
+ * user-added entries survive regeneration.
+ *
+ * If the sentinel is absent, all env is treated as user-owned — the caller
+ * gets back `{ managed: {}, user: environment }` and no drop-in gets written.
+ */
+export function splitSystemdManagedEnvironment(
+  environment: Record<string, string | undefined> | undefined,
+): {
+  managed: Record<string, string | undefined>;
+  user: Record<string, string | undefined>;
+} {
+  if (!environment) {
+    return { managed: {}, user: {} };
+  }
+  const sentinelValue = environment[OPENCLAW_MANAGED_SERVICE_ENV_KEYS_VAR];
+  const managedKeys = parseManagedKeyList(sentinelValue ?? undefined);
+  if (managedKeys.size === 0) {
+    return { managed: {}, user: { ...environment } };
+  }
+  const managed: Record<string, string | undefined> = {};
+  const user: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(environment)) {
+    const upper = key.toUpperCase();
+    if (upper === OPENCLAW_MANAGED_SERVICE_ENV_KEYS_VAR || managedKeys.has(upper)) {
+      managed[key] = value;
+      continue;
+    }
+    user[key] = value;
+  }
+  return { managed, user };
+}
+
 export function buildSystemdUnit({
   description,
   programArguments,
   workingDirectory,
   environment,
 }: GatewayServiceRenderArgs): string {
+  // Main-unit rendering excludes managed env — the managed drop-in carries it
+  // now so user customizations in the main unit survive openclaw update.
+  const { user } = splitSystemdManagedEnvironment(environment);
   const execStart = programArguments.map(systemdEscapeArg).join(" ");
   const descriptionValue = description?.trim() || "OpenClaw Gateway";
   assertNoSystemdLineBreaks(descriptionValue, "Systemd Description");
@@ -48,7 +118,7 @@ export function buildSystemdUnit({
   const workingDirLine = workingDirectory
     ? `WorkingDirectory=${systemdEscapeArg(workingDirectory)}`
     : null;
-  const envLines = renderEnvLines(environment);
+  const envLines = renderEnvLines(user);
   return [
     "[Unit]",
     descriptionLine,
@@ -77,6 +147,119 @@ export function buildSystemdUnit({
   ]
     .filter((line) => line !== null)
     .join("\n");
+}
+
+/**
+ * Render the OpenClaw-managed drop-in text. Contains only the `[Service]`
+ * section with `Environment=` lines for managed keys, plus a header comment
+ * flagging the file as auto-managed so users know not to hand-edit it.
+ *
+ * Returns an empty string when there is nothing to manage, so callers can skip
+ * writing the drop-in entirely in that case.
+ */
+export function buildSystemdManagedDropIn(
+  environment: Record<string, string | undefined> | undefined,
+): string {
+  const { managed } = splitSystemdManagedEnvironment(environment);
+  const envLines = renderEnvLines(managed);
+  if (envLines.length === 0) {
+    return "";
+  }
+  return [
+    "# Auto-managed by openclaw. Do not edit — customizations belong in the main unit.",
+    "# See https://github.com/openclaw/openclaw/issues/66248 for background.",
+    "",
+    "[Service]",
+    ...envLines,
+    "",
+  ].join("\n");
+}
+
+/**
+ * Strip inline managed env from existing main-unit text while preserving
+ * everything else (comments, blank lines, user `Environment=`, `EnvironmentFile=`,
+ * and non-`[Service]` sections). Used by `openclaw update` to migrate legacy
+ * units that have managed env inline into the new drop-in layout without
+ * touching user customizations in the same file.
+ *
+ * Lines removed:
+ *   - `Environment=OPENCLAW_SERVICE_MANAGED_ENV_KEYS=...` (the sentinel)
+ *   - `Environment=<KEY>=...` for every KEY listed in the sentinel's value
+ *
+ * Lines kept untouched:
+ *   - `EnvironmentFile=...`
+ *   - `Environment=` lines for keys not in the sentinel
+ *   - `[Unit]`, `[Service]`, `[Install]` headers
+ *   - Blank lines and comments
+ *   - Any other directive
+ */
+export function stripManagedEnvFromSystemdUnit(text: string): string {
+  const lines = text.split("\n");
+  let managedKeys: Set<string> | null = null;
+
+  // First pass: locate the sentinel line to discover what's managed.
+  for (const rawLine of lines) {
+    const parsed = parseEnvironmentDirective(rawLine);
+    if (!parsed) {
+      continue;
+    }
+    if (parsed.key.toUpperCase() === OPENCLAW_MANAGED_SERVICE_ENV_KEYS_VAR) {
+      managedKeys = parseManagedKeyList(parsed.value);
+      break;
+    }
+  }
+
+  if (!managedKeys || managedKeys.size === 0) {
+    // Nothing to strip — no sentinel means no inline managed state.
+    return text;
+  }
+
+  const filtered: string[] = [];
+  for (const rawLine of lines) {
+    const parsed = parseEnvironmentDirective(rawLine);
+    if (parsed) {
+      const upper = parsed.key.toUpperCase();
+      if (upper === OPENCLAW_MANAGED_SERVICE_ENV_KEYS_VAR || managedKeys.has(upper)) {
+        continue;
+      }
+    }
+    filtered.push(rawLine);
+  }
+  return filtered.join("\n");
+}
+
+/**
+ * Replace the `ExecStart=` line in an existing unit, preserving all other
+ * content. Returns the original text unchanged if no `ExecStart=` line is
+ * found (caller should treat that as a corrupt unit and rewrite from scratch).
+ *
+ * Used by `openclaw update` to propagate entry-filename bumps across versions
+ * without wiping user customizations elsewhere in the main unit.
+ */
+export function updateExecStartInSystemdUnit(
+  text: string,
+  programArguments: readonly string[],
+): { text: string; updated: boolean } {
+  const newExecStart = `ExecStart=${programArguments.map(systemdEscapeArg).join(" ")}`;
+  const lines = text.split("\n");
+  let updated = false;
+  const next = lines.map((line) => {
+    if (line.startsWith("ExecStart=") && line !== newExecStart) {
+      updated = true;
+      return newExecStart;
+    }
+    return line;
+  });
+  return { text: next.join("\n"), updated };
+}
+
+function parseEnvironmentDirective(rawLine: string): { key: string; value: string } | null {
+  const trimmed = rawLine.trim();
+  if (!trimmed.startsWith("Environment=")) {
+    return null;
+  }
+  const raw = trimmed.slice("Environment=".length).trim();
+  return parseSystemdEnvAssignment(raw);
 }
 
 export function parseSystemdExecStart(value: string): string[] {
