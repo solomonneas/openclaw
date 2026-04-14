@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import os from "node:os";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const execFileMock = vi.hoisted(() => vi.fn());
 
@@ -792,6 +792,11 @@ describe("systemd service control", () => {
 });
 
 describe("stageSystemdService drop-in migration", () => {
+  // Track every tmp dir created via makeTempHome so we can clean them up in
+  // afterEach. Vitest runs with shared module state (`--isolate=false`), so
+  // accumulating tmp dirs here would bloat CI disk across runs.
+  const createdTmpHomes: string[] = [];
+
   beforeEach(() => {
     // Clear fs.readFile spies from earlier describe blocks so this one runs
     // against real fs. We want real file-write behavior here — only the
@@ -806,9 +811,19 @@ describe("stageSystemdService drop-in migration", () => {
     });
   });
 
+  afterEach(async () => {
+    while (createdTmpHomes.length > 0) {
+      const dir = createdTmpHomes.pop();
+      if (dir) {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   async function makeTempHome(): Promise<string> {
     const tmpRoot = os.tmpdir();
     const tmpHome = await fs.mkdtemp(path.join(tmpRoot, "openclaw-systemd-test-"));
+    createdTmpHomes.push(tmpHome);
     return tmpHome;
   }
 
@@ -968,5 +983,106 @@ describe("stageSystemdService drop-in migration", () => {
     const secondUnit = await fs.readFile(unitPath, "utf8");
     expect(secondUnit).toBe(firstUnit);
     await expect(fs.access(`${unitPath}.bak`)).rejects.toThrow();
+  });
+
+  it("reconciles WorkingDirectory= when the dev-mode repo path drifts", async () => {
+    const tmpHome = await makeTempHome();
+    const env = { HOME: tmpHome };
+    const { stdout } = createWritableStreamMock();
+
+    // Seed an existing unit that points at an obsolete repo path.
+    const unitPath = resolveSystemdUserUnitPath(env);
+    await fs.mkdir(path.dirname(unitPath), { recursive: true });
+    const oldUnit = [
+      "[Unit]",
+      "Description=OpenClaw Gateway",
+      "",
+      "[Service]",
+      "ExecStart=/usr/bin/node /home/user/old-openclaw/dist/index.js gateway --port 18789",
+      "WorkingDirectory=/home/user/old-openclaw",
+      "Restart=always",
+      `EnvironmentFile=${tmpHome}/.openclaw/workspace/.env`,
+      "",
+      "[Install]",
+      "WantedBy=default.target",
+      "",
+    ].join("\n");
+    await fs.writeFile(unitPath, oldUnit, "utf8");
+
+    await stageSystemdService({
+      env,
+      stdout,
+      description: "OpenClaw Gateway",
+      programArguments: [
+        "/usr/bin/node",
+        "/home/user/new-openclaw/dist/index.js",
+        "gateway",
+        "--port",
+        "18789",
+      ],
+      workingDirectory: "/home/user/new-openclaw",
+      environment: { HOME: tmpHome },
+    });
+
+    const updatedUnit = await fs.readFile(unitPath, "utf8");
+    expect(updatedUnit).toContain("WorkingDirectory=/home/user/new-openclaw");
+    expect(updatedUnit).not.toContain("WorkingDirectory=/home/user/old-openclaw");
+    expect(updatedUnit).toContain(
+      "ExecStart=/usr/bin/node /home/user/new-openclaw/dist/index.js gateway --port 18789",
+    );
+    // User-added EnvironmentFile survives the targeted update.
+    expect(updatedUnit).toContain(`EnvironmentFile=${tmpHome}/.openclaw/workspace/.env`);
+  });
+
+  it("falls back to a full rewrite when the existing unit has no ExecStart= line", async () => {
+    const tmpHome = await makeTempHome();
+    const env = { HOME: tmpHome };
+    const { stdout } = createWritableStreamMock();
+
+    // Simulate a malformed main unit (manual edit stripped ExecStart).
+    const unitPath = resolveSystemdUserUnitPath(env);
+    await fs.mkdir(path.dirname(unitPath), { recursive: true });
+    const malformed = [
+      "[Unit]",
+      "Description=OpenClaw Gateway",
+      "",
+      "[Service]",
+      "Restart=always",
+      "Environment=USER_ADDED=keep-this-if-possible",
+      "",
+      "[Install]",
+      "WantedBy=default.target",
+      "",
+    ].join("\n");
+    await fs.writeFile(unitPath, malformed, "utf8");
+
+    await stageSystemdService({
+      env,
+      stdout,
+      description: "OpenClaw Gateway",
+      programArguments: [
+        "/usr/bin/node",
+        "/opt/openclaw/dist/index.js",
+        "gateway",
+        "--port",
+        "18789",
+      ],
+      environment: {
+        OPENCLAW_GATEWAY_TOKEN: "fresh-token",
+        OPENCLAW_SERVICE_MANAGED_ENV_KEYS: "OPENCLAW_GATEWAY_TOKEN",
+        HOME: tmpHome,
+      },
+    });
+
+    const rewritten = await fs.readFile(unitPath, "utf8");
+    // Full rewrite restored a valid unit with ExecStart so the next restart
+    // has something to execute.
+    expect(rewritten).toContain(
+      "ExecStart=/usr/bin/node /opt/openclaw/dist/index.js gateway --port 18789",
+    );
+    // Pre-rewrite content is captured for diffing.
+    await expect(fs.access(`${unitPath}.bak`)).resolves.toBeUndefined();
+    const backup = await fs.readFile(`${unitPath}.bak`, "utf8");
+    expect(backup).toBe(malformed);
   });
 });

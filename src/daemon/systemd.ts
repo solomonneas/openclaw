@@ -40,9 +40,10 @@ import {
   OPENCLAW_MANAGED_DROPIN_FILENAME,
   parseSystemdEnvAssignment,
   parseSystemdExecStart,
-  splitSystemdManagedEnvironment,
   stripManagedEnvFromSystemdUnit,
+  systemdUnitHasExecStart,
   updateExecStartInSystemdUnit,
+  updateWorkingDirectoryInSystemdUnit,
 } from "./systemd-unit.js";
 
 function resolveSystemdUnitPathForName(env: GatewayServiceEnv, name: string): string {
@@ -516,7 +517,6 @@ async function writeSystemdUnit({
   await fs.mkdir(path.dirname(dropInPath), { recursive: true });
 
   const serviceDescription = resolveGatewayServiceDescription({ env, environment, description });
-  const { managed } = splitSystemdManagedEnvironment(environment);
   const dropInText = buildSystemdManagedDropIn(environment);
 
   const existingUnit = await readUnitFileIfPresent(unitPath);
@@ -524,45 +524,55 @@ async function writeSystemdUnit({
   let mainUnitWritten = false;
   let migratedInlineManagedEnv = false;
 
-  if (existingUnit === null) {
-    // Fresh install — write a clean main unit with only user-preserved env.
-    // Managed keys go into the drop-in exclusively so future upgrades can
-    // rewrite the drop-in freely without touching the main unit.
+  const writeFreshUnit = async (): Promise<void> => {
     const freshUnit = buildSystemdUnit({
       description: serviceDescription,
       programArguments,
       workingDirectory,
       environment,
     });
+    if (existingUnit !== null && freshUnit !== existingUnit) {
+      // Preserve the pre-rewrite unit so operators can diff if a full regen
+      // is unexpected (malformed existing unit, missing ExecStart, etc.).
+      await fs.copyFile(unitPath, `${unitPath}.bak`);
+      backedUp = true;
+    }
     await fs.writeFile(unitPath, freshUnit, "utf8");
     mainUnitWritten = true;
+  };
+
+  if (existingUnit === null) {
+    // Fresh install — write a clean main unit with only user-preserved env.
+    // Managed keys go into the drop-in exclusively so future upgrades can
+    // rewrite the drop-in freely without touching the main unit.
+    await writeFreshUnit();
+  } else if (!systemdUnitHasExecStart(existingUnit)) {
+    // Existing unit is malformed (manual edit, truncated write, etc.) —
+    // targeted edits are unsafe because there is no ExecStart to update.
+    // Fall back to a full rewrite so the next restart has a valid unit.
+    await writeFreshUnit();
   } else {
-    // Existing unit — migrate inline managed env out if present, update
-    // ExecStart when the entry path has drifted between versions, and keep
-    // everything else (user EnvironmentFile=, user Environment=, comments,
-    // custom [Service] directives) verbatim.
+    // Existing, well-formed unit — migrate inline managed env out if present,
+    // reconcile ExecStart and WorkingDirectory with the current install plan,
+    // and keep everything else (user EnvironmentFile=, user Environment=,
+    // comments, custom [Service] directives) verbatim.
     const strippedText = stripManagedEnvFromSystemdUnit(existingUnit);
     migratedInlineManagedEnv = strippedText !== existingUnit;
-    const { text: execStartUpdated, updated: execStartChanged } = updateExecStartInSystemdUnit(
-      strippedText,
-      programArguments,
+    const { text: execStartUpdated } = updateExecStartInSystemdUnit(strippedText, programArguments);
+    const { text: workingDirectoryUpdated } = updateWorkingDirectoryInSystemdUnit(
+      execStartUpdated,
+      workingDirectory,
     );
 
-    if (execStartUpdated !== existingUnit) {
+    if (workingDirectoryUpdated !== existingUnit) {
       // Back up before rewriting so operators can diff if the migration or
-      // ExecStart update removes something unexpected.
+      // any targeted update removed something unexpected.
       const backupPath = `${unitPath}.bak`;
       await fs.copyFile(unitPath, backupPath);
       backedUp = true;
-      await fs.writeFile(unitPath, execStartUpdated, "utf8");
+      await fs.writeFile(unitPath, workingDirectoryUpdated, "utf8");
       mainUnitWritten = true;
     }
-
-    // Touching only the drop-in on pure-env changes keeps the main unit
-    // byte-identical across upgrades when nothing else drifted. execStartChanged
-    // is captured separately so callers/log surfaces can reason about why the
-    // main unit changed when it did.
-    void execStartChanged;
   }
 
   let dropInWritten = false;
@@ -581,11 +591,6 @@ async function writeSystemdUnit({
       }
     }
   }
-
-  // Silence unused-variable lint when `managed` is empty but we still want the
-  // split result available for future introspection hooks without exporting
-  // another readCommand seam.
-  void managed;
 
   return {
     unitPath,

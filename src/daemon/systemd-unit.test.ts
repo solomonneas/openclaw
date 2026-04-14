@@ -6,7 +6,9 @@ import {
   OPENCLAW_MANAGED_SERVICE_ENV_KEYS_VAR,
   splitSystemdManagedEnvironment,
   stripManagedEnvFromSystemdUnit,
+  systemdUnitHasExecStart,
   updateExecStartInSystemdUnit,
+  updateWorkingDirectoryInSystemdUnit,
 } from "./systemd-unit.js";
 
 describe("buildSystemdUnit", () => {
@@ -259,5 +261,100 @@ describe("updateExecStartInSystemdUnit", () => {
     ]);
     expect(updated).toBe(false);
     expect(text).toBe(BASE_UNIT);
+  });
+});
+
+describe("systemdUnitHasExecStart", () => {
+  it("returns true when an ExecStart= line is present", () => {
+    const unit = [
+      "[Service]",
+      "ExecStart=/usr/bin/true",
+      "Restart=always",
+      "",
+    ].join("\n");
+    expect(systemdUnitHasExecStart(unit)).toBe(true);
+  });
+
+  it("returns false when no ExecStart= line is present (malformed unit)", () => {
+    const unit = [
+      "[Service]",
+      "Restart=always",
+      "Environment=FOO=bar",
+      "",
+    ].join("\n");
+    expect(systemdUnitHasExecStart(unit)).toBe(false);
+  });
+
+  it("returns false for empty text", () => {
+    expect(systemdUnitHasExecStart("")).toBe(false);
+  });
+});
+
+describe("updateWorkingDirectoryInSystemdUnit", () => {
+  const BASE_WITH_WD = [
+    "[Service]",
+    "ExecStart=/usr/bin/node /home/user/openclaw/dist/index.js gateway",
+    "WorkingDirectory=/home/user/openclaw",
+    "Restart=always",
+    "",
+  ].join("\n");
+
+  const BASE_WITHOUT_WD = [
+    "[Service]",
+    "ExecStart=/usr/bin/node /home/user/openclaw/dist/index.js gateway",
+    "Restart=always",
+    "",
+  ].join("\n");
+
+  it("replaces an existing WorkingDirectory= line when the value drifted", () => {
+    const { text, updated } = updateWorkingDirectoryInSystemdUnit(
+      BASE_WITH_WD,
+      "/home/user/new-openclaw",
+    );
+    expect(updated).toBe(true);
+    expect(text).toContain("WorkingDirectory=/home/user/new-openclaw");
+    expect(text).not.toContain("WorkingDirectory=/home/user/openclaw\n");
+    expect(text).toContain("Restart=always");
+  });
+
+  it("returns updated=false when the value already matches", () => {
+    const { text, updated } = updateWorkingDirectoryInSystemdUnit(
+      BASE_WITH_WD,
+      "/home/user/openclaw",
+    );
+    expect(updated).toBe(false);
+    expect(text).toBe(BASE_WITH_WD);
+  });
+
+  it("inserts a new WorkingDirectory= line after ExecStart when none exists", () => {
+    const { text, updated } = updateWorkingDirectoryInSystemdUnit(
+      BASE_WITHOUT_WD,
+      "/home/user/openclaw",
+    );
+    expect(updated).toBe(true);
+    const lines = text.split("\n");
+    const execIdx = lines.findIndex((line) => line.startsWith("ExecStart="));
+    expect(lines[execIdx + 1]).toBe("WorkingDirectory=/home/user/openclaw");
+  });
+
+  it("removes the WorkingDirectory= line when the new value is undefined", () => {
+    const { text, updated } = updateWorkingDirectoryInSystemdUnit(BASE_WITH_WD, undefined);
+    expect(updated).toBe(true);
+    expect(text).not.toContain("WorkingDirectory=");
+    expect(text).toContain("ExecStart=");
+    expect(text).toContain("Restart=always");
+  });
+
+  it("is a no-op when the line is absent and new value is undefined", () => {
+    const { text, updated } = updateWorkingDirectoryInSystemdUnit(BASE_WITHOUT_WD, undefined);
+    expect(updated).toBe(false);
+    expect(text).toBe(BASE_WITHOUT_WD);
+  });
+
+  it("returns unchanged when no ExecStart= anchor exists to insert after", () => {
+    const malformed = "[Service]\nRestart=always\n";
+    const { text, updated } = updateWorkingDirectoryInSystemdUnit(malformed, "/home/user/openclaw");
+    expect(updated).toBe(false);
+    expect(text).toBe(malformed);
   });
 });

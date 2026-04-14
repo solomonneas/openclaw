@@ -231,7 +231,8 @@ export function stripManagedEnvFromSystemdUnit(text: string): string {
 /**
  * Replace the `ExecStart=` line in an existing unit, preserving all other
  * content. Returns the original text unchanged if no `ExecStart=` line is
- * found (caller should treat that as a corrupt unit and rewrite from scratch).
+ * found (caller should treat that as a corrupt unit and rewrite from scratch
+ * via `buildSystemdUnit` — see `systemdUnitHasExecStart`).
  *
  * Used by `openclaw update` to propagate entry-filename bumps across versions
  * without wiping user customizations elsewhere in the main unit.
@@ -251,6 +252,76 @@ export function updateExecStartInSystemdUnit(
     return line;
   });
   return { text: next.join("\n"), updated };
+}
+
+/**
+ * Returns true if `text` contains at least one `ExecStart=` directive. The
+ * migration path in `writeSystemdUnit` uses this to decide whether targeted
+ * in-place edits are safe: a unit with no `ExecStart=` is malformed (manual
+ * edit, truncated write, etc.) and must be rewritten from scratch instead of
+ * left untouched.
+ */
+export function systemdUnitHasExecStart(text: string): boolean {
+  return text.split("\n").some((line) => line.startsWith("ExecStart="));
+}
+
+/**
+ * Reconcile the `WorkingDirectory=` line in an existing unit with the value
+ * produced by the current install plan, without touching anything else.
+ *
+ * - If `workingDirectory` is provided and a `WorkingDirectory=` line exists,
+ *   the line is replaced in place.
+ * - If `workingDirectory` is provided and no such line exists, it is inserted
+ *   immediately after the last `ExecStart=` line (the same position
+ *   `buildSystemdUnit` writes it on fresh installs).
+ * - If `workingDirectory` is undefined and the line exists, it is removed so
+ *   an obsolete dev-mode path cannot linger and break `CHDIR` on restart.
+ * - If `workingDirectory` is undefined and no line exists, the text is
+ *   returned unchanged.
+ */
+export function updateWorkingDirectoryInSystemdUnit(
+  text: string,
+  workingDirectory: string | undefined,
+): { text: string; updated: boolean } {
+  const trimmed = workingDirectory?.trim();
+  const newLine = trimmed ? `WorkingDirectory=${systemdEscapeArg(trimmed)}` : null;
+  const lines = text.split("\n");
+
+  const existingIdx = lines.findIndex((line) => line.startsWith("WorkingDirectory="));
+
+  if (existingIdx >= 0) {
+    if (newLine === null) {
+      const next = [...lines.slice(0, existingIdx), ...lines.slice(existingIdx + 1)];
+      return { text: next.join("\n"), updated: true };
+    }
+    if (lines[existingIdx] === newLine) {
+      return { text, updated: false };
+    }
+    const next = [...lines];
+    next[existingIdx] = newLine;
+    return { text: next.join("\n"), updated: true };
+  }
+
+  if (newLine === null) {
+    return { text, updated: false };
+  }
+
+  // No existing WorkingDirectory= line — insert after the last ExecStart=
+  // line to match the layout `buildSystemdUnit` produces on fresh installs.
+  let insertAfter = -1;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (lines[i]?.startsWith("ExecStart=")) {
+      insertAfter = i;
+      break;
+    }
+  }
+  if (insertAfter < 0) {
+    // No ExecStart either — caller should already be falling back to a full
+    // rewrite in this case; return unchanged so the fallback fires.
+    return { text, updated: false };
+  }
+  const next = [...lines.slice(0, insertAfter + 1), newLine, ...lines.slice(insertAfter + 1)];
+  return { text: next.join("\n"), updated: true };
 }
 
 function parseEnvironmentDirective(rawLine: string): { key: string; value: string } | null {
