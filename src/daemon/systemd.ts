@@ -139,7 +139,7 @@ export async function readSystemdServiceExecStart(
 
     const combinedInlineEnvironment: Record<string, string> = {
       ...main.inlineEnvironment,
-      ...(dropInParsed?.inlineEnvironment ?? {}),
+      ...dropInParsed?.inlineEnvironment,
     };
     const combinedEnvironmentFileSpecs: string[] = [
       ...main.environmentFileSpecs,
