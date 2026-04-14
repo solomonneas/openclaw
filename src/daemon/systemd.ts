@@ -134,7 +134,7 @@ export async function readSystemdServiceExecStart(
     // Drop-in values override main-unit inline values by design: operators
     // depend on the managed drop-in to carry the canonical token/version
     // state across upgrades.
-    const dropInContent = await readOptionalFile(dropInPath);
+    const dropInContent = await readManagedDropInForMerge(dropInPath);
     const dropInParsed = dropInContent ? parseSystemdUnitText(dropInContent) : null;
 
     const combinedInlineEnvironment: Record<string, string> = {
@@ -470,7 +470,7 @@ async function assertSystemdAvailable(env: GatewayServiceEnv = process.env as Ga
   throw new Error(`systemctl --user unavailable: ${detail || "unknown error"}`.trim());
 }
 
-async function readOptionalFile(pathname: string): Promise<string | null> {
+async function readUnitFileIfPresent(pathname: string): Promise<string | null> {
   try {
     return await fs.readFile(pathname, "utf8");
   } catch (error) {
@@ -478,6 +478,19 @@ async function readOptionalFile(pathname: string): Promise<string | null> {
       return null;
     }
     throw error;
+  }
+}
+
+async function readManagedDropInForMerge(pathname: string): Promise<string | null> {
+  try {
+    return await fs.readFile(pathname, "utf8");
+  } catch {
+    // Drop-in is strictly additive context for the merge view — an
+    // unreadable drop-in must not fail the whole read, whether the cause is
+    // ENOENT, a permission issue, or a stale mount. Mirrors
+    // `resolveSystemdEnvironmentFiles`'s policy for missing EnvironmentFile=
+    // entries.
+    return null;
   }
 }
 
@@ -506,7 +519,7 @@ async function writeSystemdUnit({
   const { managed } = splitSystemdManagedEnvironment(environment);
   const dropInText = buildSystemdManagedDropIn(environment);
 
-  const existingUnit = await readOptionalFile(unitPath);
+  const existingUnit = await readUnitFileIfPresent(unitPath);
   let backedUp = false;
   let mainUnitWritten = false;
   let migratedInlineManagedEnv = false;
