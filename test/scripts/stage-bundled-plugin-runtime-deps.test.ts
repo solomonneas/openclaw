@@ -593,6 +593,73 @@ describe("stageBundledPluginRuntimeDeps", () => {
     expect(fs.existsSync(path.join(stagedDirect, "tests"))).toBe(false);
   });
 
+  it("accepts legacy string[] overrides for stagedRuntimeDepGlobalPruneDirectories as any-depth pruning", () => {
+    const { pluginDir, repoRoot } = createBundledPluginFixture({
+      packageJson: {
+        name: "@openclaw/fixture-plugin",
+        version: "1.0.0",
+        dependencies: { direct: "1.0.0" },
+        openclaw: { bundle: { stageRuntimeDependencies: true } },
+      },
+    });
+    const directDir = path.join(repoRoot, "node_modules", "direct");
+    fs.mkdirSync(path.join(directDir, "dist", "rules", "tests"), { recursive: true });
+    fs.mkdirSync(path.join(directDir, "tests"), { recursive: true });
+    fs.writeFileSync(
+      path.join(directDir, "package.json"),
+      '{ "name": "direct", "version": "1.0.0" }\n',
+      "utf8",
+    );
+    fs.writeFileSync(path.join(directDir, "index.js"), "module.exports = 'runtime';\n", "utf8");
+    fs.writeFileSync(
+      path.join(directDir, "dist", "rules", "tests", "bun-test.json"),
+      '{"classifier":"bun-test"}\n',
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(directDir, "tests", "top-level.test.js"),
+      "module.exports = 'remove';\n",
+      "utf8",
+    );
+
+    stageBundledPluginRuntimeDeps({
+      cwd: repoRoot,
+      stagedRuntimeDepGlobalPruneDirectories: ["tests"],
+    });
+
+    const stagedDirect = path.join(pluginDir, "node_modules", "direct");
+    expect(fs.existsSync(path.join(stagedDirect, "tests"))).toBe(false);
+    expect(fs.existsSync(path.join(stagedDirect, "dist", "rules", "tests", "bun-test.json"))).toBe(
+      false,
+    );
+  });
+
+  it("rejects stagedRuntimeDepGlobalPruneDirectories entries with unknown scopes", () => {
+    const { repoRoot } = createBundledPluginFixture({
+      packageJson: {
+        name: "@openclaw/fixture-plugin",
+        version: "1.0.0",
+        dependencies: { direct: "1.0.0" },
+        openclaw: { bundle: { stageRuntimeDependencies: true } },
+      },
+    });
+    const directDir = path.join(repoRoot, "node_modules", "direct");
+    fs.mkdirSync(path.join(directDir, "tests"), { recursive: true });
+    fs.writeFileSync(
+      path.join(directDir, "package.json"),
+      '{ "name": "direct", "version": "1.0.0" }\n',
+      "utf8",
+    );
+    fs.writeFileSync(path.join(directDir, "index.js"), "module.exports = 'runtime';\n", "utf8");
+
+    expect(() =>
+      stageBundledPluginRuntimeDeps({
+        cwd: repoRoot,
+        stagedRuntimeDepGlobalPruneDirectories: [{ basename: "tests", scope: "bogus" }],
+      }),
+    ).toThrow(/unknown staged runtime dep prune scope "bogus"/u);
+  });
+
   it("preserves nested runtime dependencies named test or tests", () => {
     const { pluginDir, repoRoot } = createBundledPluginFixture({
       packageJson: {

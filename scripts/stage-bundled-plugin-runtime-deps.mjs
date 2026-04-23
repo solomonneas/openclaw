@@ -162,11 +162,13 @@ function readInstalledDependencyVersionFromRoot(depRoot) {
 
 const defaultStagedRuntimeDepGlobalPruneSuffixes = [".d.ts", ".map"];
 // Directories to drop from every staged runtime dependency. `any-depth` entries
-// match idiomatic test-tool artifacts (Jest/Vitest snapshots, colocated __tests__
-// folders) that only appear inside dev output and can legitimately show up deep
-// in a tree. `package-root` entries are conventional top-level dev directories
-// that can collide with nested runtime data — e.g. tokenjuice ships rule data
-// under `dist/rules/tests/`, which must survive staging.
+// match idiomatic test-tool artifacts (Jest/Vitest snapshots, colocated
+// `__tests__` folders) that only appear inside dev output and can legitimately
+// show up deep in a tree. `package-root` entries are conventional top-level
+// dev directories that can collide with nested runtime data; tokenjuice, for
+// example, ships rule data under `dist/rules/tests/`, which must survive
+// staging.
+const globalPruneDirectoryScopes = new Set(["any-depth", "package-root"]);
 const defaultStagedRuntimeDepGlobalPruneDirectories = [
   { basename: "__snapshots__", scope: "any-depth" },
   { basename: "__tests__", scope: "any-depth" },
@@ -553,19 +555,42 @@ function isNodeModulesPackageRoot(segments, index) {
   return parent?.startsWith("@") === true && segments[index - 2] === "node_modules";
 }
 
-function pruneDependencyDirectoriesByBasename(depRoot, pruneEntries) {
-  if (!pruneEntries || pruneEntries.length === 0 || !fs.existsSync(depRoot)) {
-    return;
-  }
+function normalizeGlobalPruneDirectoryEntries(pruneEntries) {
   const anyDepthBasenames = new Set();
   const packageRootBasenames = new Set();
   for (const entry of pruneEntries) {
-    if (entry.scope === "package-root") {
+    // Accept bare strings as a back-compat shorthand for any-depth pruning,
+    // matching the original `string[]` shape of this override.
+    if (typeof entry === "string") {
+      anyDepthBasenames.add(entry);
+      continue;
+    }
+    if (!entry || typeof entry.basename !== "string") {
+      throw new Error(
+        `staged runtime dep prune entry must be a string or { basename, scope }: ${JSON.stringify(entry)}`,
+      );
+    }
+    const scope = entry.scope ?? "any-depth";
+    if (!globalPruneDirectoryScopes.has(scope)) {
+      throw new Error(
+        `unknown staged runtime dep prune scope "${scope}" for basename "${entry.basename}"`,
+      );
+    }
+    if (scope === "package-root") {
       packageRootBasenames.add(entry.basename);
     } else {
       anyDepthBasenames.add(entry.basename);
     }
   }
+  return { anyDepthBasenames, packageRootBasenames };
+}
+
+function pruneDependencyDirectoriesByBasename(depRoot, pruneEntries) {
+  if (!pruneEntries || pruneEntries.length === 0 || !fs.existsSync(depRoot)) {
+    return;
+  }
+  const { anyDepthBasenames, packageRootBasenames } =
+    normalizeGlobalPruneDirectoryEntries(pruneEntries);
   const queue = [depRoot];
   for (let index = 0; index < queue.length; index += 1) {
     const currentDir = queue[index];
