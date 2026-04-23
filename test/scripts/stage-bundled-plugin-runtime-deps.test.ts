@@ -529,6 +529,70 @@ describe("stageBundledPluginRuntimeDeps", () => {
     ).toBe(false);
   });
 
+  it("preserves nested runtime data directories named test or tests below the package root", () => {
+    const { pluginDir, repoRoot } = createBundledPluginFixture({
+      packageJson: {
+        name: "@openclaw/fixture-plugin",
+        version: "1.0.0",
+        dependencies: { direct: "1.0.0" },
+        openclaw: { bundle: { stageRuntimeDependencies: true } },
+      },
+    });
+    const directDir = path.join(repoRoot, "node_modules", "direct");
+    const nestedRuntimeTestsDir = path.join(directDir, "dist", "rules", "tests");
+    const nestedRuntimeSingleTestDir = path.join(directDir, "lib", "fixtures", "test");
+    const nestedSnapshotsDir = path.join(directDir, "src", "__snapshots__");
+    fs.mkdirSync(nestedRuntimeTestsDir, { recursive: true });
+    fs.mkdirSync(nestedRuntimeSingleTestDir, { recursive: true });
+    fs.mkdirSync(nestedSnapshotsDir, { recursive: true });
+    fs.mkdirSync(path.join(directDir, "test"), { recursive: true });
+    fs.mkdirSync(path.join(directDir, "tests"), { recursive: true });
+    fs.writeFileSync(
+      path.join(directDir, "package.json"),
+      '{ "name": "direct", "version": "1.0.0" }\n',
+      "utf8",
+    );
+    fs.writeFileSync(path.join(directDir, "index.js"), "module.exports = 'runtime';\n", "utf8");
+    fs.writeFileSync(
+      path.join(nestedRuntimeTestsDir, "bun-test.json"),
+      '{"classifier":"bun-test"}\n',
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(nestedRuntimeSingleTestDir, "sample.json"),
+      '{"kind":"fixture"}\n',
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(nestedSnapshotsDir, "unit.test.ts.snap"),
+      "snapshot-content\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(directDir, "test", "top-level.test.js"),
+      "module.exports = 'remove';\n",
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(directDir, "tests", "top-level.test.js"),
+      "module.exports = 'remove';\n",
+      "utf8",
+    );
+
+    stageBundledPluginRuntimeDeps({ cwd: repoRoot });
+
+    const stagedDirect = path.join(pluginDir, "node_modules", "direct");
+    expect(
+      fs.readFileSync(path.join(stagedDirect, "dist", "rules", "tests", "bun-test.json"), "utf8"),
+    ).toBe('{"classifier":"bun-test"}\n');
+    expect(
+      fs.readFileSync(path.join(stagedDirect, "lib", "fixtures", "test", "sample.json"), "utf8"),
+    ).toBe('{"kind":"fixture"}\n');
+    expect(fs.existsSync(path.join(stagedDirect, "src", "__snapshots__"))).toBe(false);
+    expect(fs.existsSync(path.join(stagedDirect, "test"))).toBe(false);
+    expect(fs.existsSync(path.join(stagedDirect, "tests"))).toBe(false);
+  });
+
   it("preserves nested runtime dependencies named test or tests", () => {
     const { pluginDir, repoRoot } = createBundledPluginFixture({
       packageJson: {

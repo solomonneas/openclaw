@@ -161,11 +161,17 @@ function readInstalledDependencyVersionFromRoot(depRoot) {
 }
 
 const defaultStagedRuntimeDepGlobalPruneSuffixes = [".d.ts", ".map"];
+// Directories to drop from every staged runtime dependency. `any-depth` entries
+// match idiomatic test-tool artifacts (Jest/Vitest snapshots, colocated __tests__
+// folders) that only appear inside dev output and can legitimately show up deep
+// in a tree. `package-root` entries are conventional top-level dev directories
+// that can collide with nested runtime data — e.g. tokenjuice ships rule data
+// under `dist/rules/tests/`, which must survive staging.
 const defaultStagedRuntimeDepGlobalPruneDirectories = [
-  "__snapshots__",
-  "__tests__",
-  "test",
-  "tests",
+  { basename: "__snapshots__", scope: "any-depth" },
+  { basename: "__tests__", scope: "any-depth" },
+  { basename: "test", scope: "package-root" },
+  { basename: "tests", scope: "package-root" },
 ];
 const defaultStagedRuntimeDepGlobalPruneFilePatterns = [
   /(?:^|\/)[^/]+\.(?:test|spec)\.(?:[cm]?[jt]sx?)$/u,
@@ -210,7 +216,7 @@ const defaultStagedRuntimeDepPruneRules = new Map([
   ["@jimp/plugin-quantize", { paths: ["src/__image_snapshots__"] }],
   ["@jimp/plugin-threshold", { paths: ["src/__image_snapshots__"] }],
 ]);
-const runtimeDepsStagingVersion = 6;
+const runtimeDepsStagingVersion = 7;
 const exactVersionSpecRe = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u;
 
 function resolveRuntimeDepPruneConfig(params = {}) {
@@ -547,11 +553,19 @@ function isNodeModulesPackageRoot(segments, index) {
   return parent?.startsWith("@") === true && segments[index - 2] === "node_modules";
 }
 
-function pruneDependencyDirectoriesByBasename(depRoot, basenames) {
-  if (!basenames || basenames.length === 0 || !fs.existsSync(depRoot)) {
+function pruneDependencyDirectoriesByBasename(depRoot, pruneEntries) {
+  if (!pruneEntries || pruneEntries.length === 0 || !fs.existsSync(depRoot)) {
     return;
   }
-  const basenameSet = new Set(basenames);
+  const anyDepthBasenames = new Set();
+  const packageRootBasenames = new Set();
+  for (const entry of pruneEntries) {
+    if (entry.scope === "package-root") {
+      packageRootBasenames.add(entry.basename);
+    } else {
+      anyDepthBasenames.add(entry.basename);
+    }
+  }
   const queue = [depRoot];
   for (let index = 0; index < queue.length; index += 1) {
     const currentDir = queue[index];
@@ -561,7 +575,16 @@ function pruneDependencyDirectoriesByBasename(depRoot, basenames) {
       }
       const fullPath = path.join(currentDir, entry.name);
       const segments = relativePathSegments(depRoot, fullPath);
-      if (basenameSet.has(entry.name) && !isNodeModulesPackageRoot(segments, segments.length - 1)) {
+      const lastSegmentIndex = segments.length - 1;
+      if (isNodeModulesPackageRoot(segments, lastSegmentIndex)) {
+        queue.push(fullPath);
+        continue;
+      }
+      if (anyDepthBasenames.has(entry.name)) {
+        removePathIfExists(fullPath);
+        continue;
+      }
+      if (packageRootBasenames.has(entry.name) && segments.length === 1) {
         removePathIfExists(fullPath);
         continue;
       }
