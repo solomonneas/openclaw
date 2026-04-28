@@ -241,17 +241,23 @@ export async function collectStatusScanOverview(params: {
             })
           : null;
         params.progress?.tick();
-        const { collectChannelStatusIssues, buildChannelsTable } =
-          await loadStatusScanRuntimeModule().then(({ statusScanRuntime }) => statusScanRuntime);
+        const {
+          collectChannelStatusIssues,
+          buildChannelsTable,
+          mergeChannelsTableWithGatewayStatus,
+        } = await loadStatusScanRuntimeModule().then(({ statusScanRuntime }) => statusScanRuntime);
         const channelIssues = channelsStatus ? collectChannelStatusIssues(channelsStatus) : [];
         if (params.labels?.summarizingChannels) {
           params.progress?.setLabel(params.labels.summarizingChannels);
         }
-        const channels = await buildChannelsTable(cfg, {
+        const baseChannels = await buildChannelsTable(cfg, {
           showSecrets: params.showSecrets,
           sourceConfig,
           includeSetupFallbackPlugins: params.includeChannelSetupRuntimeFallback !== false,
         });
+        const channels = channelsStatus
+          ? mergeChannelsTableWithGatewayStatus({ channels: baseChannels, channelsStatus })
+          : baseChannels;
         params.progress?.tick();
         return { channelsStatus, channelIssues, channels };
       })()
