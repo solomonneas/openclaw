@@ -29,8 +29,8 @@ describe("PDF document extractor with standard fonts", () => {
         minTextChars: 5,
       });
 
-      expect(result.text).toContain("Hello PDF World");
-      expect(result.images).toHaveLength(0);
+      expect(result?.text).toContain("Hello PDF World");
+      expect(result?.images).toHaveLength(0);
 
       const fontWarnings = warnings.filter((w) => w.includes("standardFontDataUrl"));
       expect(fontWarnings).toEqual([]);
@@ -56,7 +56,7 @@ describe("PDF document extractor with standard fonts", () => {
       minTextChars: 5,
     });
 
-    expect(first.text).toBe(second.text);
-    expect(first.text).toContain("Hello PDF World");
+    expect(first?.text).toBe(second?.text);
+    expect(first?.text).toContain("Hello PDF World");
   });
 });
