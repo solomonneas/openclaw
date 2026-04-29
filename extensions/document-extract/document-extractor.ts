@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { dirname, join, sep } from "node:path";
+import { dirname, join } from "node:path";
 import type {
   DocumentExtractedImage,
   DocumentExtractionRequest,
@@ -56,24 +56,29 @@ const MAX_RENDER_DIMENSION = 10_000;
 
 let canvasModulePromise: Promise<CanvasModule> | null = null;
 let pdfJsModulePromise: Promise<PdfJsModule> | null = null;
-let standardFontDataUrlCache: string | null = null;
+// `null` = not resolved yet, `false` = resolution failed once, `string` = resolved path.
+let standardFontDataUrlCache: string | false | null = null;
 
-// pdf.js requires a filesystem path (with trailing separator) to resolve the
-// fonts shipped under `pdfjs-dist/standard_fonts/`. Without it, any PDF that
-// references the 14 standard fonts (Helvetica, Times, Courier, Symbol,
-// ZapfDingbats) yields empty text plus a noisy `UnknownErrorException`.
-// pdf.js silently rejects `file://` URLs on Node, so we pass a plain path.
+// pdf.js requires a filesystem path that ends in `/` (it throws
+// `Invalid factory url ... must include trailing slash` from
+// `getFactoryUrlProp`). Without it, any PDF that references the 14 standard
+// fonts (Helvetica, Times, Courier, Symbol, ZapfDingbats) yields empty text
+// plus a noisy `UnknownErrorException`. pdf.js silently rejects `file://`
+// URLs on Node, so we pass a plain path.
 function resolveStandardFontDataUrl(): string | undefined {
+  if (standardFontDataUrlCache === false) {
+    return undefined;
+  }
   if (standardFontDataUrlCache !== null) {
-    return standardFontDataUrlCache || undefined;
+    return standardFontDataUrlCache;
   }
   try {
     const requireFn = createRequire(import.meta.url);
     const pkgPath = requireFn.resolve("pdfjs-dist/package.json");
-    standardFontDataUrlCache = join(dirname(pkgPath), "standard_fonts") + sep;
+    standardFontDataUrlCache = `${join(dirname(pkgPath), "standard_fonts")}/`;
     return standardFontDataUrlCache;
   } catch {
-    standardFontDataUrlCache = "";
+    standardFontDataUrlCache = false;
     return undefined;
   }
 }

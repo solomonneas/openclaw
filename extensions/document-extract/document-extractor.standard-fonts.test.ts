@@ -39,7 +39,7 @@ describe("PDF document extractor with standard fonts", () => {
     }
   });
 
-  it("reuses the cached standard-font path across calls", async () => {
+  it("extracts the same text on repeated calls without leaking state", async () => {
     const extractor = createPdfDocumentExtractor();
     const first = await extractor.extract({
       buffer: helloPdfBuffer,
